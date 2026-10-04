@@ -145,6 +145,71 @@ def main():
     status, _ = request("GET", "/nope")
     check("未知路径返回 404", status == 404)
 
+    # 8. 尖灭（pinchout）联合拾取：透镜体剖面，上下界面在第 3~4 列闭合。
+    pinch_limits = {
+        "min_thickness": 6, "max_thickness": 10,
+        "max_slope": 3, "max_thickness_change": 1, "max_second_diff": 6,
+    }
+    pinch_columns = []
+    for i in range(8):
+        if i in (3, 4):
+            cands = [("M", 15 + 3 * (i - 3), 9)]
+        else:
+            cands = [("U", 10 + i, 5), ("L", 16 + i, 5)]
+        cands += [("X", 0, 9), ("Y", 100, 9)]
+        pinch_columns.append(col(cands))
+    pinch_cfg = {"max_columns": 3, "max_transition_change": 6}
+
+    status, p = request("POST", "/api/horizons/trace",
+                        {"columns": pinch_columns, "limits": pinch_limits,
+                         "pinchout": pinch_cfg})
+    check("尖灭用例返回 200 且可行",
+          status == 200 and p.get("feasible") is True, str(p))
+    check("尖灭段零基起止列与长度正确",
+          p.get("pinchout") == {"start_column": 3, "end_column": 4, "length": 2},
+          str(p.get("pinchout")))
+    thick = [t["thickness"] for t in p.get("thicknesses", [])]
+    check("尖灭段内厚度为零、段外为正",
+          thick == [6, 6, 6, 0, 0, 6, 6, 6], str(thick))
+    check("尖灭列上下界面拾取同一候选",
+          all(p["upper_horizon"][i]["id"] == "M"
+              and p["lower_horizon"][i]["id"] == "M" for i in (3, 4)))
+    check("尖灭裁决值完整（置信度78/二阶差6/行程26）",
+          p.get("verdict") == {"total_confidence": 78,
+                               "max_second_diff": 6, "total_travel": 26},
+          str(p.get("verdict")))
+
+    # 9. 同一透镜体剖面省略 pinchout：强制正厚度下无解（既有行为不变）。
+    status, p = request("POST", "/api/horizons/trace",
+                        {"columns": pinch_columns, "limits": pinch_limits})
+    check("省略 pinchout 时透镜体剖面无解",
+          status == 200 and p.get("feasible") is False
+          and p.get("status") == "no_solution", str(p))
+    check("兼容请求响应不含 pinchout 字段", "pinchout" not in p)
+
+    # 10. 过渡限值过小：闭合段无法接入 -> no_solution 且不输出局部界面。
+    status, p = request("POST", "/api/horizons/trace",
+                        {"columns": pinch_columns, "limits": pinch_limits,
+                         "pinchout": {"max_columns": 3,
+                                      "max_transition_change": 5}})
+    check("过渡限值过小时 no_solution",
+          status == 200 and p.get("status") == "no_solution", str(p))
+    check("不伪造尖灭前后局部界面",
+          "upper_horizon" not in p and "lower_horizon" not in p
+          and "pinchout" not in p, str(p))
+
+    # 11. pinchout 配置非法：按字段 422。
+    for bad in ({"max_columns": 4, "max_transition_change": 6},
+                {"max_columns": 0, "max_transition_change": 6},
+                {"max_columns": 2},
+                {"max_columns": 2, "max_transition_change": -1},
+                {"max_columns": 2.5, "max_transition_change": 6}):
+        status, p = request("POST", "/api/horizons/trace",
+                            {"columns": pinch_columns, "limits": pinch_limits,
+                             "pinchout": bad})
+        check(f"非法 pinchout 返回 422: {bad}",
+              status == 422 and p.get("error") == "validation_error", str(p))
+
     failed = [name for name, ok, _ in checks if not ok]
     print(f"\n冒烟结果: {len(checks) - len(failed)}/{len(checks)} 通过")
     if failed:

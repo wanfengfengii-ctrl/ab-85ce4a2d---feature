@@ -6,6 +6,13 @@
 (上候选, 下候选) 有序对，转移时一次性检查两条界面的全部约束，
 因此不会出现"先追一条界面、再为另一条补点"的伪轨迹。
 
+可选的 pinchout（透镜体尖灭）模式：请求携带合法 pinchout 配置时，
+轨迹必须包含且仅包含一个不含首末列的连续尖灭段——段内上下界面
+拾取同一候选、厚度为零；段外仍严格分离并满足原厚度范围。跨越
+尖灭边界的相邻列厚度变化改用 pinchout.max_transition_change，
+其余坡差、厚度变化与二阶差规则不变。裁决目标与词典序完全沿用
+既有定义（尖灭列的候选置信度只计入一次）。
+
 最优性按词典序：
   1. 置信度总和最大
   2. 两条界面最大二阶差最小
@@ -20,6 +27,10 @@ MIN_COLS = 8
 MAX_COLS = 24
 MIN_CANDIDATES = 3
 MAX_CANDIDATES = 8
+
+# 尖灭段长度上限（闭区间列数）。
+MIN_PINCHOUT_COLUMNS = 1
+MAX_PINCHOUT_COLUMNS = 3
 
 
 class ValidationError(ValueError):
@@ -125,8 +136,35 @@ def _parse_limits(payload):
     return limits
 
 
+def _parse_pinchout(payload):
+    """解析可选 pinchout 配置；省略返回 None，非法按字段抛 422。"""
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValidationError("pinchout 必须是对象")
+
+    def get(name):
+        if name not in payload:
+            raise ValidationError(f"pinchout.{name} 缺失")
+        return _as_int(payload[name], f"pinchout.{name}")
+
+    max_columns = get("max_columns")
+    if not (MIN_PINCHOUT_COLUMNS <= max_columns <= MAX_PINCHOUT_COLUMNS):
+        raise ValidationError(
+            f"pinchout.max_columns 必须在 {MIN_PINCHOUT_COLUMNS}"
+            f"~{MAX_PINCHOUT_COLUMNS} 之间"
+        )
+    max_transition_change = get("max_transition_change")
+    if max_transition_change < 0:
+        raise ValidationError("pinchout.max_transition_change 不能为负")
+    return {
+        "max_columns": max_columns,
+        "max_transition_change": max_transition_change,
+    }
+
+
 def parse_request(payload):
-    """校验请求体，返回 (columns, limits)。"""
+    """校验请求体，返回 (columns, limits, pinchout)。"""
     if not isinstance(payload, dict):
         raise ValidationError("请求体必须是 JSON 对象")
     cols_raw = payload.get("columns")
@@ -137,22 +175,31 @@ def parse_request(payload):
 
     columns = [_parse_column(col, i) for i, col in enumerate(cols_raw)]
     limits = _parse_limits(payload.get("limits"))
-    return columns, limits
+    pinchout = _parse_pinchout(payload.get("pinchout"))
+    return columns, limits, pinchout
 
 
-def _build_states(column, limits):
-    """构造单列的全部合法联合状态：(上候选下标, 下候选下标)。"""
+def _build_states(column, limits, pinchout=False):
+    """构造单列的全部合法联合状态：(上候选下标, 下候选下标)。
+
+    pinchout=True 时构造尖灭列状态：上下界面拾取同一候选（厚度 0）；
+    否则要求严格分离且厚度落在 limits 范围内。
+    """
     states = []
     n = len(column)
-    for ui in range(n):
-        upper = column[ui]
-        for li in range(n):
-            if li == ui:
-                continue
-            lower = column[li]
-            thickness = lower["depth"] - upper["depth"]
-            if limits["min_thickness"] <= thickness <= limits["max_thickness"]:
-                states.append((ui, li))
+    if pinchout:
+        for ui in range(n):
+            states.append((ui, ui))
+    else:
+        for ui in range(n):
+            upper = column[ui]
+            for li in range(n):
+                if li == ui:
+                    continue
+                lower = column[li]
+                thickness = lower["depth"] - upper["depth"]
+                if limits["min_thickness"] <= thickness <= limits["max_thickness"]:
+                    states.append((ui, li))
     # 决胜稳定用：编号字典序（上编号, 下编号）。
     states.sort(key=lambda s: (column[s[0]]["id"], column[s[1]]["id"]))
     return states
@@ -169,7 +216,7 @@ def _better(candidate, current):
     return cpath < bpath
 
 
-def _run_dp(columns, col_states, limits, cap, collect_costs=False):
+def _run_dp(columns, col_states, limits, cap, collect_costs=False, pinchout=None):
     """在"每条连续三列的二阶差 <= cap"硬约束下做分层状态 DP。
 
     固定 cap 后只剩置信度（最大化）与行程（最小化）两个可加目标，
@@ -177,6 +224,9 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
 
     collect_costs=True 时顺带收集全部局部可行三元组产生的二阶差值
     （用于二分全局最优 cap 的候选集合）。
+
+    pinchout 非 None 时，跨越尖灭边界的相邻列厚度变化改用
+    pinchout["max_transition_change"]，其余规则不变。
 
     返回:
       feasible              是否存在全程可行路径
@@ -187,9 +237,12 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
     costs = set()
     hard_cap = float("inf") if cap is None else cap
     # 第 0 层：rank -> ((neg_conf, travel), path)，每状态天然唯一。
+    # 尖灭状态 (k, k) 的候选置信度只计一次。
     prev = {}
     for rank, (ui, li) in enumerate(col_states[0]):
-        conf = columns[0][ui]["confidence"] + columns[0][li]["confidence"]
+        conf = columns[0][ui]["confidence"]
+        if li != ui:
+            conf += columns[0][li]["confidence"]
         prev[rank] = ((-conf, 0), [rank])
 
     for ci in range(1, n_cols):
@@ -214,7 +267,9 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
         for rnk, (ui, li) in enumerate(cur_states):
             up, lo = cur_col[ui], cur_col[li]
             thickness = lo["depth"] - up["depth"]
-            conf_pair = up["confidence"] + lo["confidence"]
+            conf_pair = up["confidence"]
+            if li != ui:
+                conf_pair += lo["confidence"]
 
             for pr, (pui, pli) in enumerate(prev_states):
                 pup, plo = prev_col[pui], prev_col[pli]
@@ -223,7 +278,12 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
                 if uslope > limits["max_slope"] or lslope > limits["max_slope"]:
                     continue
                 pthick = plo["depth"] - pup["depth"]
-                if abs(thickness - pthick) > limits["max_thickness_change"]:
+                # 跨越尖灭边界的相邻列改用 pinchout 过渡限值。
+                if pinchout is not None and (pui == pli) != (ui == li):
+                    tchange_limit = pinchout["max_transition_change"]
+                else:
+                    tchange_limit = limits["max_thickness_change"]
+                if abs(thickness - pthick) > tchange_limit:
                     continue
 
                 records = predecessors_of(pr)
@@ -270,7 +330,7 @@ def _run_dp(columns, col_states, limits, cap, collect_costs=False):
     return best is not None, best, costs
 
 
-def solve(columns, limits):
+def solve(columns, limits, pinchout=None):
     """联合追踪求解。
 
     策略（严格按裁决词典序）：
@@ -279,44 +339,99 @@ def solve(columns, limits):
       2. 对候选二阶差值二分：求最小的 K，使"在硬约束 K 下仍能达到
          置信度 C*"（可达置信度对 K 单调）；
       3. 在 K 下做最终（置信度, 行程, 编号路径）词典序 DP。
+
+    pinchout 非 None 时，轨迹必须包含且仅包含一个不含首末列、长度
+    1~max_columns 的连续尖灭段（段内上下界面拾取同一候选、厚度为 0，
+    段外严格分离）；跨越尖灭边界的厚度变化改用
+    pinchout["max_transition_change"]。实现上对每个候选尖灭段窗口
+    各跑一次上述流程，再按同一词典序对全部窗口的结果整体裁决，
+    因此尖灭段的位置与长度本身也参与全局最优选择。
     """
-    col_states = [_build_states(col, limits) for col in columns]
-    if any(not states for states in col_states):
-        return {"feasible": False}
+    n_cols = len(columns)
+    if pinchout is None:
+        windows = [None]
+    else:
+        max_len = min(pinchout["max_columns"], n_cols - 2)
+        windows = [
+            (start, start + length)
+            for length in range(1, max_len + 1)
+            for start in range(1, n_cols - length)
+        ]
 
-    cap_limit = limits.get("max_second_diff")
-    feasible, best_l, costs = _run_dp(
-        columns, col_states, limits, cap_limit, collect_costs=True
-    )
-    if not feasible:
-        return {"feasible": False}
-    max_confidence = -best_l[0][0]
-
-    # 0 始终是候选（二阶差可能恰好为 0；列数 >= 8 必有连续三列）。
-    candidates = sorted(costs | {0})
-
-    def reaches_max_confidence(cap):
-        ok, best, _ = _run_dp(columns, col_states, limits, cap)
-        return ok and -best[0][0] == max_confidence
-
-    lo_i, hi_i = 0, len(candidates) - 1
-    while lo_i < hi_i:
-        mid = (lo_i + hi_i) // 2
-        if reaches_max_confidence(candidates[mid]):
-            hi_i = mid
+    # 第一遍：每个窗口在用户上限下求最大置信度，同时收集二阶差候选。
+    # 置信度是裁决第一关键字，达不到全局最大置信度的窗口不可能胜出，
+    # 其后续二分与最终 DP 直接剪枝（不改变裁决结果）。
+    window_runs = []
+    best_conf = None
+    for window in windows:
+        if window is None:
+            col_states = [_build_states(col, limits) for col in columns]
         else:
-            lo_i = mid + 1
-    optimal_cap = candidates[lo_i]
+            start, end = window
+            col_states = [
+                _build_states(col, limits, pinchout=start <= ci < end)
+                for ci, col in enumerate(columns)
+            ]
+        if any(not states for states in col_states):
+            continue
 
-    _, best, _ = _run_dp(columns, col_states, limits, optimal_cap)
-    (neg_conf, total_travel), ranks = best
+        cap_limit = limits.get("max_second_diff")
+        feasible, best_l, costs = _run_dp(
+            columns, col_states, limits, cap_limit,
+            collect_costs=True, pinchout=pinchout,
+        )
+        if not feasible:
+            continue
+        max_confidence = -best_l[0][0]
+        window_runs.append((window, col_states, max_confidence, costs))
+        if best_conf is None or max_confidence > best_conf:
+            best_conf = max_confidence
+
+    if not window_runs:
+        return {"feasible": False}
+
+    # 第二遍：达到全局最大置信度的窗口按同一词典序整体裁决。
+    best_overall = None
+    for window, col_states, max_confidence, costs in window_runs:
+        if max_confidence < best_conf:
+            continue
+
+        # 0 始终是候选（二阶差可能恰好为 0；列数 >= 8 必有连续三列）。
+        candidates = sorted(costs | {0})
+
+        def reaches_max_confidence(cap):
+            ok, best, _ = _run_dp(
+                columns, col_states, limits, cap, pinchout=pinchout
+            )
+            return ok and -best[0][0] == max_confidence
+
+        lo_i, hi_i = 0, len(candidates) - 1
+        while lo_i < hi_i:
+            mid = (lo_i + hi_i) // 2
+            if reaches_max_confidence(candidates[mid]):
+                hi_i = mid
+            else:
+                lo_i = mid + 1
+        optimal_cap = candidates[lo_i]
+
+        _, best, _ = _run_dp(
+            columns, col_states, limits, optimal_cap, pinchout=pinchout
+        )
+        (neg_conf, total_travel), ranks = best
+        key = (neg_conf, optimal_cap, total_travel, tuple(ranks))
+        if best_overall is None or key < best_overall[0]:
+            best_overall = (key, window, col_states, ranks)
+
+    (_, optimal_cap, total_travel, _), window, col_states, ranks = best_overall
     path = [col_states[ci][rank] for ci, rank in enumerate(ranks)]
+    total_conf = -best_overall[0][0]
     return _build_result(
-        columns, path, -neg_conf, optimal_cap, total_travel
+        columns, path, total_conf, optimal_cap, total_travel, window
     )
 
 
-def _build_result(columns, path, total_conf, max_second_diff, total_travel):
+def _build_result(columns, path, total_conf, max_second_diff, total_travel,
+                  pinchout_window=None):
     upper, lower, thicknesses = [], [], []
     u_slopes, l_slopes = [], []
     u_seconds, l_seconds = [], []
@@ -349,7 +464,7 @@ def _build_result(columns, path, total_conf, max_second_diff, total_travel):
                 {"columns": [ci - 2, ci - 1, ci], "second_diff": lo["depth"] - 2 * pl + ppl}
             )
 
-    return {
+    result = {
         "feasible": True,
         "upper_horizon": upper,
         "lower_horizon": lower,
@@ -362,15 +477,29 @@ def _build_result(columns, path, total_conf, max_second_diff, total_travel):
             "total_travel": total_travel,
         },
     }
+    if pinchout_window is not None:
+        start, end = pinchout_window
+        result["pinchout"] = {
+            "start_column": start,
+            "end_column": end - 1,
+            "length": end - start,
+        }
+    return result
 
 
 def trace(payload):
     """供 HTTP 层调用的入口：校验 -> 求解。"""
-    columns, limits = parse_request(payload)
-    result = solve(columns, limits)
+    columns, limits, pinchout = parse_request(payload)
+    result = solve(columns, limits, pinchout)
     if not result["feasible"]:
         result["status"] = "no_solution"
-        result["message"] = "不存在满足全部约束的上下界面联合拾取组合"
+        if pinchout is None:
+            result["message"] = "不存在满足全部约束的上下界面联合拾取组合"
+        else:
+            result["message"] = (
+                "不存在满足全部约束且含完整闭合再重开尖灭段的"
+                "上下界面联合拾取组合"
+            )
     else:
         result["status"] = "ok"
     return result
