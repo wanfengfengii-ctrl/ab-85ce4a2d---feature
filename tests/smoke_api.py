@@ -124,7 +124,92 @@ def main():
           "upper_horizon" not in payload and "lower_horizon" not in payload,
           str(payload))
 
-    # 5. 入参校验：列数不足。
+    # 5. 透镜状尖灭：中部两列双界面汇于同一候选 P，未启用尖灭时无解，
+    #    启用后必须给出唯一尖灭段（零基 4~5、长度 2）并完整重开。
+    lens = [
+        col([("U", 10, 5), ("L", 18, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("U", 11, 5), ("L", 17, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("U", 12, 5), ("L", 16, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("U", 13, 5), ("L", 15, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("P", 14, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("P", 14, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("U", 13, 5), ("L", 15, 5), ("X", 0, 9), ("Y", 30, 9)]),
+        col([("U", 12, 5), ("L", 16, 5), ("X", 0, 9), ("Y", 30, 9)]),
+    ]
+    lens_limits = {
+        "min_thickness": 2, "max_thickness": 10,
+        "max_slope": 2, "max_thickness_change": 2, "max_second_diff": 1,
+    }
+    status, payload_p = request("POST", "/api/horizons/trace",
+                                {"columns": lens, "limits": lens_limits})
+    check("透镜剖面未启用尖灭时无解",
+          status == 200 and payload_p.get("status") == "no_solution",
+          str(payload_p))
+
+    pinch = {"max_columns": 3, "max_transition_change": 2}
+    status, payload_p = request(
+        "POST", "/api/horizons/trace",
+        {"columns": lens, "limits": lens_limits, "pinchout": pinch})
+    check("尖灭用例返回 200 且可行",
+          status == 200 and payload_p.get("feasible") is True, str(payload_p))
+    check("尖灭段证据为零基 4~5、长度 2",
+          payload_p.get("pinchout") ==
+          {"start_column": 4, "end_column": 5, "length": 2},
+          str(payload_p.get("pinchout")))
+    th = [t["thickness"] for t in payload_p.get("thicknesses", [])]
+    check("厚度序列 8,6,4,2,0,0,2,4", th == [8, 6, 4, 2, 0, 0, 2, 4], str(th))
+    up = payload_p.get("upper_horizon", [])
+    lo = payload_p.get("lower_horizon", [])
+    check("尖灭段内上下界面选择同一候选且同深度",
+          all(up[i]["id"] == "P" and lo[i]["id"] == "P"
+              and up[i]["depth"] == lo[i]["depth"] for i in (4, 5)))
+    check("段外上下界面严格分离",
+          all(up[i]["depth"] < lo[i]["depth"] for i in (0, 1, 2, 3, 6, 7)))
+    check("尖灭响应仍给出坡差与二阶差证据",
+          len(payload_p.get("slopes", {}).get("upper", [])) == 7
+          and len(payload_p.get("second_diffs", {}).get("upper", [])) == 6)
+    check("尖灭段不含首末列",
+          payload_p["pinchout"]["start_column"] >= 1
+          and payload_p["pinchout"]["end_column"] <= 6)
+
+    # 5b. 边界厚度变化新限值过紧 -> no_solution，不返回局部界面。
+    bad_pinch = dict(pinch, max_transition_change=1)
+    status, payload_p = request(
+        "POST", "/api/horizons/trace",
+        {"columns": lens, "limits": lens_limits, "pinchout": bad_pinch})
+    check("无法闭合时 no_solution 且无局部界面",
+          status == 200 and payload_p.get("status") == "no_solution"
+          and "upper_horizon" not in payload_p
+          and "lower_horizon" not in payload_p,
+          str(payload_p))
+
+    # 5c. 无法形成完整闭合再开轨迹（末列只有汇聚候选）。
+    lens_dead = [dict(c) for c in lens]
+    lens_dead[7] = col([("P", 14, 5), ("X", 0, 9), ("Y", 30, 9)])
+    status, payload_p = request(
+        "POST", "/api/horizons/trace",
+        {"columns": lens_dead, "limits": lens_limits, "pinchout": pinch})
+    check("末列无法重开时 no_solution",
+          status == 200 and payload_p.get("status") == "no_solution"
+          and "upper_horizon" not in payload_p, str(payload_p))
+
+    # 5d. pinchout 非法配置按字段返回 422。
+    for bad_pinch in (
+        {},
+        {"max_columns": 3},
+        {"max_transition_change": 2},
+        {"max_columns": 0, "max_transition_change": 2},
+        {"max_columns": 4, "max_transition_change": 2},
+        {"max_columns": "2", "max_transition_change": 2},
+        {"max_columns": 2, "max_transition_change": -1},
+    ):
+        status, payload_p = request(
+            "POST", "/api/horizons/trace",
+            {"columns": lens, "limits": lens_limits, "pinchout": bad_pinch})
+        check(f"非法 pinchout {bad_pinch} 返回 422",
+              status == 422, f"status={status} {payload_p}")
+
+    # 6. 入参校验：列数不足。
     status, payload = request("POST", "/api/horizons/trace",
                               {"columns": columns[:5], "limits": LIMITS})
     check("列数不足返回 422", status == 422, str(payload))
